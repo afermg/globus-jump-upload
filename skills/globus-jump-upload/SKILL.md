@@ -70,6 +70,38 @@ globus gcs collection show <COLLECTION_ID>
 works without any token. Token-required collections take an
 `Authorization: Bearer <token>` header.
 
+### Two filesystem views per collection (HTTPS vs Transfer API)
+
+GCS v5 collections can expose two different filesystem views of the
+same backing storage, and they have **different path semantics**:
+
+- The **HTTPS endpoint** (`https://g-XXXXX.../path`) addresses the
+  collection's full POSIX root. Anonymous PUTs landed at e.g.
+  `https://.../images/JUMP-lite/file.parquet` and that's where the file
+  exists on disk.
+- The **Transfer API** (used by `globus ls`, `globus transfer`, and the
+  Globus file-manager web UI) addresses a **chrooted-to-the-user's-home**
+  view. A web UI request for `/images/JUMP-lite/` becomes an FTP
+  `MLST ~/images/JUMP-lite/` and may fail with `EndpointPermissionDenied
+  / Path not allowed` — even though the HTTPS HEAD at the same logical
+  path returns 200.
+
+For some collections (this one included) the chrooted view happens to
+also contain an `images/` symlink, so `globus ls COLLECTION:/images/`
+works too. For others it won't. Always verify with `globus ls
+COLLECTION:/` what the Transfer view actually exposes before sending
+file-manager URLs to non-technical recipients.
+
+**Web file-manager URL gotcha:** the path query parameter must be fully
+URL-encoded. A stray `%1F` (DEL) at the end of the encoded path —
+copy-paste artifact from the web UI's URL bar — produces the same
+`Path not allowed` error and is easy to misdiagnose as a permissions
+issue. The right form is e.g.:
+
+```
+https://app.globus.org/file-manager?origin_id=<COLLECTION_ID>&origin_path=%2Fimages%2FJUMP-lite%2F
+```
+
 ### Protocol gotchas
 
 These are the non-obvious bits of the GCS v5 HTTPS API:
