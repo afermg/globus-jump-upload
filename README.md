@@ -1,180 +1,82 @@
-# Globus JUMP-lite Upload Instructions
+# globus-jump-upload
 
-This repository contains instructions and scripts for uploading JUMP-lite data to the Broad Globus collection.
+Push large directory trees (e.g. zarr stores) to a Globus Connect Server v5
+collection over its **HTTPS endpoint** instead of the relay-based Globus
+transfer path. Useful when:
 
-## Destination Collection
+- The GCP relay (`relay.globusonline.org:2223`) is firewalled.
+- The collection permits anonymous (or token-authenticated) HTTPS writes.
+- Directory creation is locked down on the collection — so the data must
+  ship as one or more files into a pre-existing folder.
 
-- **Collection ID**: `20317ea0-5bda-471d-aba2-191c9028f1d8`
-- **Path**: `/images/JUMP-lite/`
-- **Web Interface**: https://app.globus.org/file-manager?origin_id=20317ea0-5bda-471d-aba2-191c9028f1d8&origin_path=%2Fimages%2FJUMP-lite%2F
+## What's in here
 
-## Prerequisites
+| File | Purpose |
+|------|---------|
+| `upload_https_tar_parts.py` | Streams `tar -b1 -cf -` of a source dir and uploads it as N parallel `.tar.partNNNNN` chunks plus a `.tar.manifest`. |
+| `receive_concat.py` | On the receiver side: reads the manifest, concatenates parts in order, optionally cleans up. |
+| `flake.nix` / `flake.lock` | Reproducible env (`nix develop`) with `globus-cli`, `globusconnectpersonal`, and a Python with `requests` for the uploader. |
+| `skills/globus-jump-upload/SKILL.md` | Operational playbook (diagnostic recipe, protocol gotchas, dual-API path semantics) for future agents. |
 
-1. Install Globus CLI:
-   ```bash
-   pip install globus-cli
-   # or with uv:
-   uv pip install globus-cli
-   ```
-
-2. Authenticate with Globus:
-   ```bash
-   globus login
-   ```
-
-## Option 1: Upload from Local Machine (Globus Connect Personal)
-
-### Setup
-
-1. Download and install Globus Connect Personal:
-   - Linux: https://www.globus.org/globus-connect-personal
-   - Follow installation instructions for your OS
-
-2. Start Globus Connect Personal and note your endpoint ID:
-   ```bash
-   globus endpoint search --filter-scope my-endpoints
-   ```
-
-### Upload Data
+## Quick start
 
 ```bash
-# Replace YOUR_LOCAL_ENDPOINT_ID with your Globus Connect Personal endpoint
-globus transfer YOUR_LOCAL_ENDPOINT_ID:/home/amunoz/datasets/alan/jump_lite/ \
-  20317ea0-5bda-471d-aba2-191c9028f1d8:/images/JUMP-lite/ \
-  --recursive \
-  --label "JUMP-lite dataset upload"
+# Inside the repo:
+nix develop
+
+# Upload one source dir as parallel tar parts to a destination URL.
+python upload_https_tar_parts.py \
+  /path/to/source_dir \
+  https://g-XXXXX.YYYYY.data.globus.org/path/to/dest_folder \
+  --chunk-size $((64*1024*1024)) --workers 32
+
+# On the receive side, after pulling the parts:
+python receive_concat.py /local/dir/with/parts
+tar -xf source_dir.tar
 ```
 
-## Option 2: Upload from Shared/Institutional Endpoint (e.g., Broad or oppy)
+The destination folder must already exist on the collection. The script
+PUTs `{name}.tar.part00000`, `…part00001`, … and a `{name}.tar.manifest`
+into it.
 
-### Find Your Endpoint
+## Why split the tar — the speedup that mattered
 
-Search for your institutional endpoint:
-```bash
-# Example: search for Broad endpoints
-globus endpoint search "Broad"
+This collection's HTTPS frontend rate-limits a single sustained PUT to
+about **2 MB/s**, regardless of identity. Splitting the same tar into
+64 MiB parts uploaded over 32 parallel TCP connections moves the bottleneck
+from per-stream cap to aggregate bandwidth.
 
-# List all accessible endpoints
-globus endpoint search --filter-scope my-endpoints
-```
+Measured on the JUMP-lite MQ dataset (117 GB):
 
-### Upload Data
+| Strategy | Throughput | Wall time (mq) | Wall time (mq + hq + d20) |
+|----------|-----------|----------------|---------------------------|
+| Single tar PUT (`-T -` with Content-Length) | ~2 MB/s | ~15 h | ~58 h |
+| 32 × 64 MiB parts in parallel | ~50 MB/s | ~40 min | ~3 h |
 
-Once you've identified your source endpoint ID:
+Roughly a **20× speedup** at no cost beyond having to concatenate the
+parts on the receiving side.
 
-```bash
-globus transfer SOURCE_ENDPOINT_ID:/path/to/jump_lite/ \
-  20317ea0-5bda-471d-aba2-191c9028f1d8:/images/JUMP-lite/ \
-  --recursive \
-  --label "JUMP-lite dataset upload from oppy"
-```
+## Reassembling on the receiver
 
-## Monitoring Transfers
-
-Check transfer status:
-```bash
-# List recent transfers
-globus task list
-
-# Get details of a specific transfer
-globus task show TASK_ID
-
-# Monitor transfer in real-time
-globus task wait TASK_ID --polling-interval 10
-```
-
-## Example Upload Script
-
-See `upload_to_globus.sh` for a complete example script.
-
-## Data Location
-
-**Source data (oppy)**: `/home/amunoz/datasets/alan/jump_lite/`
-
-**Destination**: Broad Globus Collection at `/images/JUMP-lite/`
-
-## Troubleshooting
-
-### Authentication Issues
-```bash
-# Re-authenticate if needed
-globus logout
-globus login
-```
-
-### Permission Issues
-If you get permission errors, contact Jess or the collection's admin to ensure you have write access.
-
-### Large Transfers
-For very large datasets, Globus transfers are:
-- Fault-tolerant (auto-retry)
-- Can resume after interruption
-- Run in the background (you can close terminal)
-- Optimized for high-throughput
-
-## Known issue: relay handshake blocked by firewall (and the HTTPS workaround)
-
-`globusconnectpersonal -setup KEY` will hang indefinitely on networks that
-silently drop incoming bytes from `relay.globusonline.org:2223` after the
-TCP handshake. Symptom:
-
-- TCP connect to `relay.globusonline.org:2223` succeeds.
-- The client sends its `SSH-2.0-OpenSSH_*` version banner.
-- The server never sends back its `Remote protocol version` banner.
-  `ssh -v ...` shows the connection established, prints the local
-  version string, and then hangs.
-
-We saw this on both `oppy` and `moby` (Broad / EBI networks). It is not
-a Nix or GCP install bug — it's a network-layer blackhole. Diagnose with:
+Two equivalent ways:
 
 ```bash
-# Confirm TCP handshake works but no banner arrives:
-timeout 8 bash -c 'exec 3<>/dev/tcp/relay.globusonline.org/2223; head -c 64 <&3'
-# Hang + timeout (exit 124) = the relay protocol is blocked.
+# Verifying (preferred — uses the manifest):
+python receive_concat.py /dir/with/parts
+tar -xf jpegxl_lossy_mq.zarr.tar
 
-# Confirm SSH itself works elsewhere (rules out a broken ssh binary):
-timeout 5 ssh -v -p 22 -o BatchMode=yes git@github.com
-# Should print "Remote protocol version ..." immediately.
+# Bare shell (skips manifest verification):
+cat MQ/jpegxl_lossy_mq.zarr.tar.part?????  > mq.tar
+tar -xf mq.tar
 ```
 
-Fix paths in priority order:
-1. Get IT to allow outbound TCP to `*.globusonline.org` on port `2223`
-   (relay control plane) and the GridFTP data ports (`50000-51000` by default).
-2. Run GCP from a machine on a less restrictive network — but check first
-   with the same `/dev/tcp` probe.
-3. **Skip GCP entirely** and upload via the destination collection's HTTPS
-   endpoint (if it has one). See below.
+`receive_concat.py` reads the `.tar.manifest` JSON (total bytes, chunk
+count) and refuses to write the wrong byte count.
 
-### HTTPS upload workaround
+## Known issue: the relay path doesn't work here
 
-Globus Connect Server v5 collections expose a per-collection HTTPS URL
-that bypasses the relay/GridFTP machinery completely. Find it with:
-
-```bash
-globus gcs collection show <COLLECTION_ID> | grep -i 'HTTPS URL'
-# HTTPS URL: https://g-XXXXX.YYYYY.ZZZZZ.data.globus.org
-```
-
-Anonymous writes may be enabled (`Disable Anonymous Writes: False`) — in
-which case `curl -X PUT --data-binary @file URL/path` just works. Even
-with auth required, the token from `globus login` covers it.
-
-Two non-obvious gotchas before scripting a bulk upload:
-
-- **Directories must exist before child PUTs.** `PUT /a/b/file` returns
-  `404` if `/a/b/` doesn't exist. Create directories with
-  `PUT /a/b/` (trailing slash). `MKCOL` / `POST` return `307` redirects
-  and don't create anything useful.
-- **Port 443 only.** TLSFTP is also on 443 on these collections, so the
-  collection itself is reachable through any firewall that allows HTTPS
-  — even though the relay on 2223 isn't.
-
-`upload_https.py` in this repo implements the directory-then-file pattern
-with parallel uploads, HEAD-based skipping for resume, and exponential
-backoff retries. See the script's `--help` and `skills/globus-jump-upload/SKILL.md`
-for the operational playbook captured from this transfer.
-
-## Support
-
-- Globus Documentation: https://docs.globus.org/
-- Globus CLI Reference: https://docs.globus.org/cli/
+`globusconnectpersonal -setup KEY` hangs at "starting relaytool setup" on
+networks where `relay.globusonline.org:2223` accepts TCP but drops the
+server's SSH banner. The HTTPS path in this repo is the workaround. The
+diagnostic recipe + protocol gotchas are written up in
+`skills/globus-jump-upload/SKILL.md`.
