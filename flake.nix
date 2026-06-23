@@ -48,6 +48,11 @@
         '';
       };
 
+      pythonEnv = pkgs.python3.withPackages (p: with p; [
+        requests
+        urllib3
+      ]);
+
     in {
       packages.${system} = {
         default = globusconnectpersonal;
@@ -59,10 +64,12 @@
         packages = [
           globusconnectpersonal
           pkgs.globus-cli
+          pythonEnv
         ];
         shellHook = ''
           echo "globus-cli            $(globus version 2>/dev/null | head -1)"
           echo "globusconnectpersonal $(globusconnectpersonal -version 2>/dev/null | tail -1)"
+          echo "python3               $(python3 --version)"
         '';
       };
     };
